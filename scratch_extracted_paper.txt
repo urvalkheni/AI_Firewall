@@ -1,0 +1,1846 @@
+1
+2
+3
+
+AI Firewall: A Shared, Risk-Based Authorization Gateway with
+Exact-Action Human Approval Binding for Autonomous AI Agents
+Anonymous Author(s)
+
+5
+
+7
+
+Abstract
+
+1
+
+8
+
+As Large Language Model (LLM) agents are granted autonomous
+access to external environments via tool execution APIs and standardized protocols like the Model Context Protocol (MCP), they
+become susceptible to indirect prompt injection, tool poisoning, and
+unauthorized capability execution. Existing defenses rely heavily on
+model alignment, prompt filtering, or custom language interpreters;
+however, these techniques either fail against adaptive attacks or
+lack binding authorization mechanisms when human-in-the-loop
+oversight is required.
+This paper presents AI Firewall, a shared, risk-based authorization gateway that mediates tool invocations across heterogeneous
+agent adapters prior to downstream execution. AI Firewall enforces
+a tripartite security protocol: (1) deterministic transformation of
+heterogeneous tool proposals into canonical action identities using
+RFC 8785 JSON Canonicalization and SHA-256 digests; (2) declarative policy evaluation that computes risk scores and mandates cryptographic Ed25519 approval envelopes bound to the exact canonical
+action digest; and (3) transactional lifecycle fencing on SQLite with
+monotonic worker epochs that prevents approval replay, parameter
+tampering, and post-timeout execution races.
+We evaluate AI Firewall through an empirical evaluation across
+a formal 46-scenario security benchmark (31 consequential attacks
+and 15 legitimate tasks), supported by a comprehensive 107-test
+regression suite. In the evaluated benchmark suite, AI Firewall
+successfully blocked 31 of 31 consequential attacks (100.0% observed, Clopper–Pearson 95% exact binomial confidence interval
+[88.8%, 100.0%]) while executing 15 of 15 legitimate tasks without false denials (100.0% observed utility, 95% CI [78.2%, 100.0%]).
+Under a thread-bounded connection registry optimization, median authorization overhead is reduced by 81.29% (from 3.0153 ms
+to 0.5643 ms), with P99 tail latency dropping by 95.97% (from
+24.0348 ms to 0.9679 ms) and batch throughput scaling to 1,716.4
+operations per second. We verify protocol interoperability across
+MCP stdio child processes and simulated LangGraph-style workflows, and formalize the downstream execution boundary where
+tool idempotency is required to guarantee end-to-end execution
+safety upon network timeouts.
+
+Autonomous AI agents powered by Large Language Models (LLMs)
+are transitioning from isolated chat interfaces into proactive systems that invoke external APIs, query relational databases, alter
+file systems, and execute code on behalf of human users [? ? ]. To
+facilitate tool interoperability, industry architectures have rapidly
+converged on shared protocols such as Anthropic’s Model Context
+Protocol (MCP) [? ] and agent orchestration frameworks such as
+LangChain and LangGraph.
+However, giving LLMs the autonomy to execute external tools
+introduces severe security risks. When an agent processes untrusted
+external data—such as web pages, email bodies, or database query
+results—an adversary can embed adversarial instructions known as
+indirect prompt injection (IPI) [? ]. These injected instructions hijack
+the model’s reasoning loop, causing it to invoke consequential tools
+without user knowledge, exfiltrate confidential data, or destroy
+critical infrastructure.
+Recent security literature has proposed diverse countermeasures.
+DataSentinel [? ] explores game-theoretic prompt filtering; however,
+purely text-based classifiers suffer from false positives and remain
+vulnerable to adaptive prompt evasions. IsolateGPT [? ] isolates
+application execution contexts, and CaMeL [? ] enforces capabilitybased information flow tracking within a custom Python interpreter.
+Similarly, Progent [? ] uses domain-specific languages and SMT
+solvers to enforce monotonic privilege narrowing.
+Despite these advancements, an architectural vulnerability remains at the boundary between agent decision-making and external tool dispatch: the absence of a shared, protocol-agnostic
+authorization gateway that cryptographically binds human
+approval to the exact tool call being executed. When current
+frameworks implement human-in-the-loop (HITL) checkpoints:
+
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+
+61
+
+63
+64
+
+6
+
+10
+
+60
+
+62
+
+4
+
+9
+
+59
+
+Introduction
+
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+
+(1) Approval Substitution & Tampering: Approvals are typically granted in natural language or against coarse user
+prompts rather than the exact serialized parameters sent
+over the network wire. An attacker can manipulate arguments after an approval is granted or substitute a destructive action for a benign one.
+(2) Replay & Concurrency Races: Frameworks lack transactional lifecycle management to ensure that an approval
+envelope is redeemed strictly once. In concurrent or distributed agent worker environments, network timeouts or
+retries can cause duplicate executions of non-idempotent
+actions.
+(3) Cross-Adapter Inconsistencies: Different frameworks
+(e.g., LangChain vs. MCP) employ disparate parameter naming conventions, casing, and serialization formats, making
+centralized policy auditing impossible.
+
+Keywords
+AI Agent Security, Runtime Authorization, Tool Use, Prompt Injection, Model Context Protocol, Cryptographic Approval Envelopes,
+Fencing Tokens
+ACM Reference Format:
+Anonymous Author(s). 2026. AI Firewall: A Shared, Risk-Based Authorization Gateway with Exact-Action Human Approval Binding for Autonomous
+AI Agents. In Proceedings of Review Manuscript (Preprint). ACM, New York,
+NY, USA, 7 pages.
+Preprint, Changa, India
+2026.
+1
+
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+
+Preprint, October 2026, Changa, India
+
+117
+
+1.1
+
+118
+
+In this paper, we introduce AI Firewall, an independent, risk-based
+authorization gateway designed to sit between AI agent frameworks
+and downstream tool servers. Our primary contributions are:
+
+119
+120
+
+Anon.
+
+Our Contributions
+
+a policy DSL and an SMT solver to guarantee monotonic privilege
+narrowing across tool calls.
+
+2.3
+
+(1) Exact-Action Canonicalization & Cryptographic Envelope Binding: We implement an RFC 8785 JSON Canonicalization Scheme (JCS) hasher [? ] that maps heterogeneous tool proposals into unique SHA-256 digests. Human approvals are signed using Ed25519 cryptographic
+envelopes [? ] that bind directly to this digest, eliminating parameter tampering, substitution, and authenticationdowngrade attacks.
+(2) Transactional State Machine with Monotonic Fencing:
+We design an ACID-compliant authorization lifecycle on
+SQLite. By combining single-use nonces, BEGIN EXCLUSIVE
+TRANSACTION reservation semantics, and monotonic dispatch epoch counters (dispatch_epoch), the gateway ensures single-use redemption and fences off stale or crashed
+workers.
+(3) Empirical Performance Profiling & Optimization: We
+identify that persistence connection setup accounts for over
+98% of gateway overhead in naive on-demand implementations. We design and validate a manager-owned thread
+connection registry that reduces median authorization latency from 3.0153 ms to 0.5643 ms (81.29% reduction),
+scaling single-core throughput to 1,716.4 ops/sec.
+(4) Empirical Evaluation & Multi-Adapter Verification:
+We evaluate AI Firewall across a 46-scenario security benchmark and a 107-test unit regression suite, evaluating crash
+recovery across an 8-scenario failure matrix, real OS childprocess MCP stdio framing, and simulated LangGraph interrupt/checkpoint cycles. We establish an evidence baseline
+and formalize the limits of gateway fencing when downstream tools lack server-side idempotency.
+
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+149
+150
+151
+
+154
+155
+156
+157
+158
+159
+160
+161
+162
+
+Research Gap: Independent Gateway
+Authorization
+
+While CaMeL and Progent provide compelling defenses, they require either running code in a bespoke Python interpreter or deeply
+modifying the internal agent runtime loop. They do not address
+environments where tool execution occurs across distributed protocols (such as MCP over stdio or SSE), nor do they provide cryptographic verification when consequential actions mandate human
+sign-off. Furthermore, they do not account for concurrency races,
+stale worker fencing, or downstream retry semantics. AI Firewall
+addresses this gap by operating as an external, protocol-aware
+network mediator (Table 1).
+
+Threat Model and Security Objectives
+
+165
+166
+167
+168
+169
+170
+171
+172
+173
+174
+
+179
+180
+181
+182
+183
+184
+185
+186
+187
+188
+189
+190
+
+192
+193
+194
+195
+196
+197
+198
+199
+200
+201
+202
+203
+204
+
+3.1
+
+Assets and Adversary Capabilities
+
+We consider an environment where an AI agent interacts with
+external resources (filesystems, databases, APIs) via tools (Figure 3).
+• Adversary Capabilities: The adversary can inject arbitrary natural language into any untrusted data source retrieved by the agent. The adversary can influence tool call
+parameters, attempt parameter tampering between human
+approval and execution, replay intercepted approvals, and
+manipulate concurrency timing.
+• Untrusted Components: The LLM reasoning core, prompt
+context, and agent planning logic are untrusted.
+• Trusted Computing Base (TCB): The AI Firewall gateway, its local SQLite database, the human reviewer’s private key, and the gateway’s cryptographic key registry are
+trusted.
+
+2 Background and Related Work
+2.1 Prompt Injection and Agent Exploitation
+Indirect prompt injection was first systematically categorized by
+Greshake et al. [? ], who demonstrated that arbitrary instructions
+embedded in retrieved data could commandeer an LLM’s application context. Debenedetti et al. [? ] established AgentDojo, a dynamic
+benchmark comprising 97 tasks and 629 security test cases, showing
+that prompt-based safeguards and commercial model alignments
+consistently fail against adaptive injection attacks.
+
+205
+206
+207
+208
+209
+210
+211
+212
+213
+214
+215
+216
+217
+218
+219
+220
+221
+
+163
+164
+
+178
+
+191
+
+3
+
+152
+153
+
+176
+177
+
+121
+122
+
+175
+
+2.2
+
+3.2
+
+System-Level and Language-Level Defenses
+
+Security Objectives
+(1) Mandatory Interception & Policy Enforcement: No
+tool proposal may execute without passing declarative policy evaluation. Explicit DENY rules take precedence over
+ALLOW.
+(2) Exact-Action Approval Binding: An approval granted
+for action proposal 𝐴 cannot be redeemed to execute action
+proposal 𝐴′ ≠ 𝐴. Any alteration to tool names, resource
+URIs, or arguments must invalidate the approval.
+
+Recognizing that model-level alignment is insufficient, recent work
+has shifted toward system-level containment. Wu et al. [? ] presented IsolateGPT, which introduces execution isolation for LLM
+applications. Debenedetti et al. [? ] introduced CaMeL, which separates control and data flows by extracting application logic from
+user prompts and tracking capabilities within a custom Python
+interpreter, solving 77% of AgentDojo tasks with provable security.
+Shi et al. [? ] proposed Progent, which enforces least privilege using
+2
+
+222
+223
+224
+225
+226
+227
+228
+229
+230
+231
+232
+
+AI Firewall: A Shared, Risk-Based Authorization Gateway with Exact-Action Human Approval Binding for Autonomous AI Agents
+
+Preprint, October 2026, Changa, India
+
+Table 1: Comparison of AI Firewall against representative AI agent defense architectures.
+
+233
+
+291
+292
+
+234
+235
+236
+237
+238
+239
+240
+
+293
+
+Approach
+
+Enforcement Locus
+
+Policy Model
+
+Human Approval Binding
+
+Adapter Scope
+
+DataSentinel [? ]
+IsolateGPT [? ]
+CaMeL [? ]
+Progent [? ]
+AI Firewall (Ours)
+
+Prompt Classifier
+App Isolation Sandbox
+Python Interpreter
+Agent Execution Loop
+External Gateway
+
+Minimax Detection
+Coarse Sandbox Rules
+Information Flow / Capabilities
+SMT Privilege DSL
+Risk & Epoch Rules
+
+None
+Unbound Natural Language
+None (Capability Rules)
+None (Narrowing Rules)
+Cryptographic Ed25519 to RFC 8785 Digest
+
+Unmediated Prompts
+295
+Natural Language APIs
+296
+In-Interpreter Values
+LangChain / OpenAI SDK297
+298
+MCP & LangChain
+
+294
+
+299
+
+241
+
+300
+
+242
+
+(3) Single-Use Replay Resistance: An approval envelope
+cannot be redeemed more than once, even across concurrent worker threads or restarted processes.
+(4) Monotonic Dispatch Fencing: Stale workers whose execution leases have expired must be prevented from writing
+results or claiming execution authority.
+(5) Fail-Closed Ambiguity Handling: If a worker crashes
+while an operation is in flight, the gateway must mark the
+state as UNKNOWN and block automatic retries.
+
+243
+244
+245
+246
+247
+248
+249
+250
+251
+252
+253
+254
+255
+256
+
+4
+
+• LOW_RISK (𝑆 < 20.0): Autonomous ALLOW. Authorized
+solely by a gateway-signed AuthorizationDecisionRecord.
+• MEDIUM_RISK (20.0 ≤ 𝑆 < 70.0): APPROVAL_REQUIRED
+(Standard Human Confirmation).
+• HIGH_RISK (𝑆 ≥ 70.0): APPROVAL_REQUIRED (Hardwarebound MFA / Elevated Role).
+• POLICY_DENIED: Immediate fail-closed rejection.
+
+259
+260
+261
+
+Exact-Action Approval Envelopes
+
+264
+265
+266
+267
+268
+269
+270
+271
+272
+273
+274
+275
+276
+277
+
+282
+283
+284
+285
+286
+287
+288
+289
+290
+
+305
+306
+307
+
+310
+311
+312
+
+Envelope = ⟨approval_id, 𝑑 act, claims, 𝜎Ed25519 ⟩
+
+(4)
+
+314
+315
+
+4.1
+
+Canonical Action Identity
+
+The envelope claims embed:
+
+ActionProposal = ⟨𝑃, 𝐼, 𝑅, 𝐵⟩
+
+316
+317
+
+Tool invocations arriving from different frameworks represent identical actions with differing formatting. AI Firewall maps all incoming proposals into a canonical schema:
+
+318 , 𝑡 expires
+claims = ⟨nonce, auth_level, reviewer_id, key_id, pol_ver, pol_epoch, 𝑡 issued
+319
+(5)
+320
+Before redemption, the gateway verifies that:
+
+(1)
+
+(1) VerifyEd25519 (𝜎, claims ∥ 𝑑 act, 𝐾pub ) = True.
+where:
+(2) 𝑑 act == SHA-256(JCS(CurrentAction)).
+• 𝑃 = ⟨user_id, agent_id, session_id⟩ represents the calling
+(3) claims.pol_epoch == Gateway.current_epoch.
+principal.
+(4) 𝑡 current ≤ 𝑡 expires and 𝐾pub is not revoked.
+• 𝐼 = ⟨tool_server_id, tool_name, operation_type, canonical_params⟩
+captures the exact operation.
+4.4 Transactional Lifecycle & Worker Fencing
+• 𝑅 = ⟨resource_uri, preconditions⟩ defines the target and
+The
+gateway persists lifecycle state in SQLite with write-ahead
+TOCTOU preconditions.
+logging (WAL). State transitions follow a strict directed graph (Fig• 𝐵 = ⟨policy_version, policy_epoch, idempotency_key, expires_at_utc⟩
+ure 2). To prevent race conditions, reservation is executed inside
+specifies authorization parameters.
+BEGIN EXCLUSIVE TRANSACTION:
+Parameters are normalized using the RFC 8785 JSON Canonicalization Scheme (JCS) [? ]: dictionary keys are lexicographically
+sorted by UTF-16 code units, whitespace is removed, and floatingpoint values are formatted deterministically. The canonical action
+digest is computed as:
+
+UPDATE approvals SET lifecycle_state = ’RESERVED’,
+worker_id = ?, dispatch_epoch = dispatch_epoch
++ 1, lease_expires_at_utc = ? WHERE approval_id
+= ? AND lifecycle_state = ’APPROVED’;
+
+321
+322
+323
+324
+325
+326
+327
+328
+329
+330
+331
+332
+333
+334
+335
+336
+
+𝑑 act = SHA-256(JCS(ActionProposal))
+
+279
+
+281
+
+304
+
+313
+
+278
+
+280
+
+303
+
+309
+
+When human approval is required, the gateway generates a challenge payload containing 𝑑 act . The reviewer inspects the canonical
+action details and issues an approval envelope:
+
+System Architecture and Design
+
+AI Firewall is structured into four modular subsystems: Adapter
+Normalization, Policy & Risk Engine, Cryptographic Envelope Verifier, and the Transactional Execution Broker (Figure 1).
+
+262
+263
+
+302
+
+308
+
+4.3
+
+257
+258
+
+301
+
+4.2
+
+If rowcount != 1, another worker won the race, and ConcurrencyContentionErro
+337
+is raised.
+338
+When transitioning to DISPATCHING, the gateway validates that
+339
+the worker’s token matches (worker_id, dispatch_epoch). If a
+340
+worker stalls and its lease expires, the background reaper recovers
+341
+the lease:
+342
+
+(2)
+
+Declarative Policy & Risk Scoring
+
+When an action is proposed, the Policy Engine evaluates registered
+rules. The evaluated risk score 𝑆 ∈ [0.0, 100.0] is computed as:
+(︄
+)︄
+∑︁
+𝑆 = min 100.0, 𝐵 base + 𝑊taint · 𝑇 +
+𝑊param,𝑖 · 𝑃𝑖
+(3)
+
+343
+• If crashed in RESERVED: Reset to APPROVED (zero network
+344
+bytes were sent; safe to re-reserve).
+345
+• If crashed in DISPATCHING: Transition to UNKNOWN (ERR_DISPATCH_TIMEOU
+346
+Automatic retries are strictly prohibited to prevent dupli347
+cate side effects.
+
+𝑖
+
+where 𝐵 base is the base tool risk tier, 𝑇 ∈ {0, 1} indicates untrusted
+context taint, and 𝑃𝑖 represents sensitive parameter multipliers.
+Risk scores map to authorization tiers:
+3
+
+348
+
+Preprint, October 2026, Changa, India
+
+Anon.
+
+1. Protocol Adapters
+(MCP, LangChain)
+
+349
+350
+
+3. Declarative Policy
+& Risk Scoring Engine
+
+2. RFC 8785 Canonical Hasher
+(𝑑 act = SHA-256 ( JCS ) )
+
+407
+APPROVAL_REQUIRED
+
+ALLOW
+
+352
+
+Autonomous Path
+(ALLOW Record)
+
+353
+354
+
+Challenge Path
+(Sign Ed25519 Envelope)
+
+4. Cryptographic Envelope Verification
+(VerifyEd25519 , Epoch, Nonce, Action Digest)
+
+355
+
+5. ACID SQLite Lifecycle State Machine
+(Atomic Lease Reservation & Monotonic dispatch_epoch)
+
+358
+
+361
+
+6. Execution Broker Dispatch
+(Fenced Tool Invocation)
+
+362
+
+Figure 1: End-to-end authorization, verification, and fenced execution pipeline.
+
+364
+
+366
+
+5.2
+
+Consequential
+
+PROPOSED
+
+367
+368
+
+PENDING_APPROVAL
+
+ALLOW
+
+369
+370
+
+APPROVED
+
+Valid Envelope
+
+371
+
+378
+379
+380
+381
+382
+383
+384
+385
+386
+387
+388
+389
+390
+391
+392
+393
+394
+395
+396
+397
+398
+399
+400
+401
+402
+403
+404
+405
+406
+
+419
+420
+
+422
+423
+
+365
+
+377
+
+416
+
+421
+
+363
+
+376
+
+413
+
+418
+
+360
+
+375
+
+412
+
+417
+
+359
+
+374
+
+411
+
+415
+
+357
+
+373
+
+410
+
+414
+
+356
+
+372
+
+408
+409
+
+351
+
+Lease Expire (Reset)
+
+BEGIN EXCLUSIVE
+
+RESERVED
+(𝑒 + 1)
+Epoch Verified
+
+Manager-Owned Thread Connection
+Registry
+
+424
+425
+426
+
+To resolve this bottleneck without violating thread isolation or
+leaking operating system file descriptors upon manager shutdown,
+we replaced on-demand connection allocation with a managerowned thread connection registry:
+
+427
+
+self._thread_conns: dict[int, sqlite3.Connection]
+= {}
+self._conns_lock = threading.Lock()
+
+431
+
+428
+429
+430
+
+432
+433
+
+When a worker thread requests a connection via _get_connection(): 434
+DISPATCHING
+(1) The manager acquires _conns_lock and inspects _thread_conns435
+436
+using the caller’s integer thread identifier (threading.get_ident()).
+437
+(2) If no connection exists, a dedicated connection is initialized
+UNKNOWN
+SUCCEEDED
+FAILED
+with check_same_thread=False and cached in _thread_conns.438
+439
+PRAGMA statements are executed exactly once per thread.
+440
+(3) Cross-Thread Shutdown Safety: Because connections are
+Figure 2: Lifecycle state machine and crash recovery bound441
+initialized with check_same_thread=False, the managing
+aries.
+442
+orchestrator thread can safely iterate over _thread_conns
+443
+during close() and invoke .close() on all connections
+444
+without triggering sqlite3.ProgrammingError.
+445
+(4) Post-Close Fail-Closed Behavior: The manager sets an
+446
+5 Implementation and Persistence Optimization
+_is_closed = True sentinel. Subsequent calls to _get_connection()
+447
+immediately raise StorageError, ensuring that workers
+The gateway is implemented in Python 3.14 with zero third-party
+448
+cleanly abort during shutdown.
+framework dependencies outside standard cryptography (pycryptodome).
+449
+Under this optimization, the persistence latency of an autonomous
+450
+authorization drops from 2.98 ms to ∼0.43 ms. Pure computation
+5.1 Analysis of Baseline Persistence Overhead
+451
+(canonicalization, policy evaluation, and Ed25519 signing: ∼0.133 ms)
+452
+During initial profiling in Phase 4.10, microbenchmarks of the
+accounts for 23.6% of the pipeline, while transactional database
+453
+un-optimized gateway revealed that pure canonicalization and
+persistence accounts for 76.4%.
+454
+policy computation accounted for only 1.28% of authorization la455
+tency (0.039 ms), while SQLite persistence operations accounted for
+6 Experimental Methodology and Results
+456
+98.72% (2.98 ms). Profiling identified the root cause: each request
+Our evaluation addresses five core research questions:
+457
+opened and closed 8 separate database connections across ac458
+tion recording, decision insertion, synthetic envelope generation,
+6.1 RQ1 & RQ2: Empirical Security Benchmark
+459
+atomic reservation, dispatch transition, outcome update, and auEvaluation (46 Scenarios)
+460
+dit logging. Each connection executed two PRAGMA statements
+461
+(foreign_keys = ON and journal_mode = WAL), causing repeated
+We evaluated AI Firewall against the established Phase 4.8.2 correc462
+filesystem stat calls, lock acquisition, and WAL index header retive benchmark comprising 46 discrete scenarios: 31 consequen463
+reads.
+tial attack scenarios and 15 legitimate tasks. We compared System
+4
+
+464
+
+AI Firewall: A Shared, Risk-Based Authorization Gateway with Exact-Action Human Approval Binding for Autonomous AI Agents
+
+465
+466
+467
+
+C (AI Firewall) against Baseline A (Direct Tool Execution without
+Mediation) and Baseline B (Policy Engine with Direct Dispatch).
+Empirical Findings (Table 2):
+
+Under connection caching (Table 3), median latency dropped
+from 3.0153 ms to 0.5643 ms, representing an 81.29% reduction.
+Most notably, tail latency (P99) fell by 95.97% (from 24.03 ms down
+to 0.97 ms), as connection caching eliminated intermittent lock
+contention and file-descriptor allocation stalls.
+Under concurrent write loads (Table 4), median latency remained
+sub-millisecond (0.71 ms and 0.62 ms). P95/P99 latencies exhibited
+expected increases (34.31 ms and 5.99 ms) due to SQLite’s serialized
+BEGIN EXCLUSIVE TRANSACTION locking, confirming safe serial
+execution without lock corruption.
+
+468
+
+• Baseline A suffered 100% exploit success across all 31 attacks.
+• Baseline B successfully blocked policy-denied tools (Cats
+3–5) but was completely vulnerable (16/16 dispatches) to
+approval-bypass attacks, parameter tampering (Cat 6), approval replay (Cat 7), and TOCTOU precondition drift (Cat
+8).
+• System C successfully blocked all 31 consequential attacks
+(100.0% observed, 95% CI [88.8%, 100.0%]) while completing
+all 15 legitimate tasks without false denials (95% CI [78.2%,
+100.0%]). We note that this observed 100% rate describes the
+evaluated synthetic scenario suite and does not establish
+a universal zero-failure probability against arbitrary realworld LLM attacks.
+
+469
+470
+471
+472
+473
+474
+475
+476
+477
+478
+479
+480
+481
+482
+
+6.2
+
+485
+486
+487
+488
+489
+
+6.4
+
+492
+493
+494
+495
+496
+497
+498
+499
+500
+501
+502
+503
+504
+505
+506
+507
+508
+509
+510
+511
+
+Regression and Invariant Test Suite (107
+Tests)
+
+514
+515
+516
+517
+518
+519
+520
+521
+522
+
+6.3
+
+526
+527
+528
+529
+530
+531
+532
+
+536
+537
+538
+539
+540
+541
+542
+543
+544
+545
+546
+547
+548
+549
+550
+
+7 Discussion and Security Analysis
+7.1 Defense-in-Depth vs. Model Alignment
+
+551
+
+A recurring theme in recent AI safety research is that LLM prompt
+alignment is fundamentally non-robust [? ? ]. Adversaries continuously discover jailbreaks, multi-lingual encodings, and promptinjection perturbations that bypass system prompts. AI Firewall
+treats the entire LLM reasoning pipeline as untrusted, enforcing
+security invariants at the deterministic network boundary. Even if
+an agent’s internal reasoning is compromised, it cannot produce
+valid cryptographic signatures over unauthorized canonical digests.
+
+554
+
+552
+553
+
+555
+556
+557
+558
+559
+560
+561
+562
+
+7.2
+
+563
+
+The Wire Dispatch Boundary &
+Downstream Idempotency
+
+564
+565
+
+A crucial security boundary identified in our audit involves postdispatch crashes. When the gateway transitions an approval to
+DISPATCHING and sends bytes over the network wire, it cannot
+revoke those packets if the worker process crashes before recording
+the result:
+
+512
+513
+
+525
+
+535
+
+(1) Model Context Protocol (MCP): Evaluated by executing
+an actual OS child process running MCPAdapter over standard input/output pipes with JSON-RPC 2.0 framing. All 9
+test cases passed, verifying protocol challenge interception
+and fenced execution over real OS pipes.
+(2) LangChain / LangGraph: Evaluated across 7 test cases
+simulating graph interrupt and state checkpoint serialization across simulated process restarts.
+(3) Cross-Adapter Parity: 5 paired test cases demonstrated
+that identical user tool invocations originating from either
+MCP or LangChain produced identical canonical hashes
+(𝑑 act ) and identical policy verdicts.
+
+• Canonicalization & Hasher (22 tests): Deterministic JCS
+sorting, UTF-16 code units, number representations.
+• Cryptographic Envelopes & Key Registry (18 tests):
+Ed25519 signature checks, expiration timestamps, key revocation.
+• Policy Engine (15 tests): Mandatory deny precedence,
+taint propagation, auth tier mapping.
+• SQLite Lifecycle & Worker Fencing (10 tests): Schema
+constraints, monotonic epochs, lease expiration.
+• Execution Broker & Preconditions (10 tests): Precondition hashing, challenge emission, broker dispatch gates.
+• Hardening & Deduplication (12 tests): Single-use nonces,
+parameter binding, replay prevention.
+• Adapter Mappings & Parity (11 tests): Schema conversion, error handling, cross-adapter parity.
+• MCP Stdio Subprocess (9 tests): Real OS child-process
+pipes, JSON-RPC framing, downstream invocation tracing.
+• Simulated LangGraph Checkpoints (7 tests): Interrupt
+cycles, dictionary state reload across restarts.
+• Connection Registry & Concurrency (16 tests): Deterministic cleanup, 8 crash-recovery scenarios, 20-thread
+concurrency.
+
+491
+
+524
+
+534
+
+RQ5: Integration Validation &
+Cross-Adapter Parity
+
+We verified protocol interoperability across two adapter paradigms:
+
+In addition to the 46-scenario benchmark, the gateway’s implementation is verified by a 107-test unit and regression suite executing
+in 0.55–0.61 seconds:
+
+490
+
+523
+
+533
+
+483
+484
+
+Preprint, October 2026, Changa, India
+
+566
+567
+568
+569
+570
+571
+
+RQ3 & RQ4: Performance Optimization and
+Scalability Benchmark
+
+Gateway Fencing ≠ End-to-End Exactly-Once
+
+(6)
+
+572
+573
+
+We benchmarked the end-to-end Autonomous ALLOW pipeline (canonicalization + policy evaluation + Ed25519 signing + database transactions + dispatch + audit logging) on Linux x86_64. We compared
+baseline on-demand connections against the thread-bounded connection registry over 100 timed trials (20 warmup runs) and a
+200-operation throughput batch.
+
+While the gateway marks the internal state as UNKNOWN and prohibits automatic re-dispatch, duplicate side effects can occur if
+the downstream tool endpoint is not idempotent. Therefore, we
+formalize the requirement that downstream services executing consequential actions must accept an Idempotency-Key or enforce
+conditional request fencing based on 𝑑 act .
+5
+
+574
+575
+576
+577
+578
+579
+580
+
+Preprint, October 2026, Changa, India
+
+581
+582
+
+Anon.
+
+Table 2: Comparative evaluation across the 46-scenario benchmark suite. Category 6 separates client schema failure (03A) from
+runtime broker authentication hierarchy rejection (03B).
+
+584
+585
+586
+587
+588
+589
+590
+591
+592
+593
+594
+595
+596
+597
+598
+599
+600
+601
+
+Scenario Category (Count)
+
+Baseline A (Direct Execution)
+
+Baseline B (Policy-Only)
+
+System C (AI Firewall Ours)
+
+Cat 1: Legitimate Read-Only (5)
+Cat 2: Legitimate Mutations (5)
+Cat 3: Direct Mandatory Denials (5)
+Cat 4: Untrusted Taint Elevation (5)
+Cat 5: Privilege Escalation (5)
+Cat 6: Envelope Tampering (6)
+– CORR_CAT6_03A (Schema Invalid)
+– CORR_CAT6_03B (Broker Downgrade)
+Cat 7: Replay & Revocation (5)
+Cat 8: TOCTOU State Drift (5)
+Cat 9: Core Direct Proposal (5)
+
+5/5 Dispatched
+5/5 Dispatched
+5/5 Dispatched (Vulnerable)
+5/5 Dispatched (Vulnerable)
+5/5 Dispatched (Vulnerable)
+6/6 Dispatched (Vulnerable)
+1/1 Dispatched (Vulnerable)
+1/1 Dispatched (Vulnerable)
+5/5 Dispatched (Vulnerable)
+5/5 Dispatched (Vulnerable)
+5/5 Dispatched
+
+5/5 Dispatched
+5/5 Dispatched
+0/5 Dispatched (Blocked)
+0/5 Dispatched (Blocked)
+0/5 Dispatched (Blocked)
+6/6 Dispatched (Vulnerable)
+1/1 Dispatched (Vulnerable)
+1/1 Dispatched (Vulnerable)
+5/5 Dispatched (Vulnerable)
+5/5 Dispatched (Vulnerable)
+5/5 Dispatched
+
+5/5 Dispatched (ALLOW)
+5/5 Dispatched (APPROVED)
+0/5 Dispatched (DENY)
+0/5 Dispatched (CHALLENGE)
+0/5 Dispatched (DENY)
+0/6 Dispatched (BLOCKED)
+0/1 Dispatched (SIGN_FAIL)
+0/1 Dispatched (BROKER_DENY)
+0/5 Dispatched (BLOCKED)
+0/5 Dispatched (ABORTED)
+5/5 Dispatched (ALLOW)
+
+Total Consequential Attacks (Cats 3–8)
+Attacks Blocked (Observed Success)
+Clopper–Pearson 95% Confidence Interval
+Unauthorized Dispatches (Vulnerable)
+Legitimate Tasks Completed (Cats 1, 2, 9)
+Clopper–Pearson 95% Confidence Interval
+
+31 Attacks
+0 / 31 (0.0%)
+[0.0%, 11.2%]
+31 / 31 (100.0%)
+15 / 15 (100.0%)
+[78.2%, 100.0%]
+
+31 Attacks
+15 / 31 (48.4%)
+[30.2%, 66.9%]
+16 / 31 (51.6%)
+15 / 15 (100.0%)
+[78.2%, 100.0%]
+
+31 Attacks
+31 / 31 (100.0%)
+[88.8%, 100.0%]
+0 / 31 (0.0%)
+15 / 15 (100.0%)
+[78.2%, 100.0%]
+
+605
+606
+
+Table 3: Microbenchmark performance comparison between
+on-demand and connection-registry configurations (calculated over 100 timed trials after 20 untimed warmup runs
+using 𝑃𝑘 = 𝑆 [⌊𝑛 · 𝑘⌋] on a zero-indexed array 𝑆).
+
+607
+608
+
+Metric
+
+Baseline (On-Demand)
+
+Optimized (Registry)
+
+Median Latency
+P95 Latency
+P99 Tail Latency
+Mean Latency
+Min Latency
+Max Latency
+Batch Throughput
+
+3.0153 ms
+3.7991 ms
+24.0348 ms
+3.0986 ms
+2.0183 ms
+24.0348 ms
+397.7 ops/s
+
+0.5643 ms
+0.8325 ms
+0.9679 ms
+0.5909 ms
+0.5180 ms
+0.9679 ms
+1,716.4 ops/s
+
+609
+610
+611
+612
+613
+614
+615
+616
+617
+618
+619
+620
+621
+622
+623
+624
+
+(3) Transport Scope: Integration was evaluated over local
+stdio and in-process interfaces; remote MCP transports
+(HTTP Server-Sent Events) and distributed database backends (PostgreSQL) were not benchmarked.
+(4) Human Reviewer Trust: The security of the human-inthe-loop mechanism assumes that the human reviewer careDelta / Improvement
+fully inspects canonicalized parameters rather than blindly
+-81.29% (-2.451 ms)
+signing
+-78.09% (-2.967
+ms) approval challenges.
+-95.97% (-23.067 ms)
+-80.93% (-2.508 ms)
+Reproducibility
+-74.33% (-1.500 ms)
+To ensure
+complete
+scientific reproducibility, all source code, tests,
+-95.97%
+(-23.067
+ms)
+and raw
+measurement data are archived in the repository:
++331.58%
+(+1318.7)
+
+627
+628
+629
+630
+631
+632
+633
+634
+635
+636
+637
+638
+
+643
+644
+645
+646
+647
+648
+649
+650
+651
+652
+653
+654
+655
+656
+657
+658
+659
+
+661
+662
+663
+664
+665
+666
+667
+668
+669
+670
+671
+672
+673
+674
+
+• Core Implementation: src/ai_firewall/
+675
+• Regression Suite (107 Tests): pytest -o pythonpath=src
+Table 4: Multithreaded and multiprocess scaling under the
+676
+-q (execution time: 0.55 s)
+connection registry.
+677
+• Corrective Benchmark Suite (46 Scenarios): scratch/corrective_ben
+678
+• Real MCP Subprocess Harness: tests/test_mcp_subprocess_integr
+679
+Configuration Concurrency Total Ops Median Latency Throughput • Crash Recovery & Concurrency Suite: tests/test_connection_lifec
+680
+Multithreaded
+10 Threads
+300 Ops
+0.7075 ms
+1,167.1 ops/sec • Frozen Benchmark Vectors: phase_4_11_raw_benchmark_results.js
+681
+Multiprocess
+4 Processes
+200 Ops
+0.6165 ms
+1,265.9 ops/sec and phase_4_12_raw_verification_results.json
+682
+
+625
+626
+
+642
+
+660
+
+602
+
+604
+
+640
+641
+
+583
+
+603
+
+639
+
+10
+8
+
+Limitations and Threats to Validity
+
+Conclusion and Future Work
+
+We presented AI Firewall, a shared, risk-based authorization gateway for autonomous AI agents. By coupling RFC 8785 canonical
+action identity with Ed25519 cryptographic approval envelopes,
+AI Firewall eliminates parameter tampering, approval substitution,
+and replay attacks across heterogeneous agent adapters. ACIDcompliant SQLite lifecycle management with monotonic dispatch
+epoch fencing guarantees safe mutual exclusion and fail-closed
+crash recovery. Through a manager-owned thread connection registry, the gateway achieves sub-millisecond median latency (0.56 ms)
+and 1,716 ops/sec throughput, demonstrating that rigorous runtime
+authorization imposes negligible overhead on AI agent execution.
+
+(1) Synthetic Evaluation Suite: While our 46-scenario benchmark and 107 regression tests cover adversarial parameter
+mutations, timing races, and protocol errors, they represent
+a curated synthetic test suite rather than a live multi-tenant
+production deployment.
+(2) Third-Party Package Absences: The official mcp and
+langgraph pip packages were not installed in the test environment. While protocol framing was validated via real OS
+subprocess stdio pipes, testing with official SDK runtime
+classes remains future work.
+6
+
+683
+684
+685
+686
+687
+688
+689
+690
+691
+692
+693
+694
+695
+696
+
+AI Firewall: A Shared, Risk-Based Authorization Gateway with Exact-Action Human Approval Binding for Autonomous AI Agents
+
+697
+698
+699
+700
+
+References
+
+Future work will focus on integrating enterprise Key Management Systems (KMS), benchmarking remote HTTP/SSE MCP transports, and validating official SDK runtimes across live multi-agent
+production deployments.
+
+Preprint, October 2026, Changa, India
+
+755
+756
+757
+758
+
+701
+
+759
+
+702
+
+760
+
+703
+
+761
+
+704
+
+762
+
+705
+
+763
+
+706
+
+764
+
+707
+
+765
+
+708
+
+766
+
+709
+
+767
+
+710
+
+768
+
+711
+
+769
+
+712
+
+770
+
+713
+
+771
+
+714
+
+772
+
+715
+
+773
+
+716
+
+774
+
+717
+
+775
+
+718
+
+776
+
+719
+
+777
+
+720
+
+778
+
+721
+
+779
+
+722
+
+780
+
+723
+
+781
+
+724
+
+782
+
+725
+
+783
+
+726
+
+784
+
+727
+
+785
+
+728
+
+786
+
+729
+
+787
+
+730
+
+788
+
+731
+
+789
+
+732
+
+790
+
+733
+
+791
+
+734
+
+792
+
+735
+
+793
+
+736
+
+794
+
+737
+
+795
+
+738
+
+796
+
+739
+
+797
+
+740
+
+798
+
+741
+
+799
+
+742
+
+800
+
+743
+
+801
+
+744
+
+802
+
+745
+
+803
+
+746
+
+804
+
+747
+
+805
+
+748
+
+806
+
+749
+
+807
+
+750
+
+808
+
+751
+
+809
+
+752
+
+810
+811
+
+753
+754
+
+7
+
+812
+
+
